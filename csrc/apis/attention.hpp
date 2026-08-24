@@ -455,7 +455,7 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
 }
 #endif
 
-#if 0
+#if 1
 
 static void register_apis(pybind11::module_& m) {
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE

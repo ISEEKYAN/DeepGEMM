@@ -20,6 +20,8 @@ from ._C import (
     set_tc_util,
     get_tc_util,
     set_ignore_compile_dims,
+    set_batch_invariant,
+    get_batch_invariant,
     set_block_size_multiple_of,
     set_pdl,
     get_pdl,

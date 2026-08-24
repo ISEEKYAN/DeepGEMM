@@ -121,7 +121,7 @@ static torch::Tensor transform_k_grouped_sf_into_required_layout(const torch::Te
 
 #endif
 
-#if 0
+#if 1
 
 static void register_apis(pybind11::module_& m) {
 #if DG_TENSORMAP_COMPATIBLE

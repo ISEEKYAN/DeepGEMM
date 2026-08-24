@@ -766,7 +766,7 @@ static void cublaslt_gemm_tt(const torch::Tensor& a, const torch::Tensor& b,
     cublaslt_gemm_nt(a.transpose(0, 1), b, d, c);
 }
 
-#if 0
+#if 1
 
 static void register_apis(pybind11::module_& m) {
 

@@ -8,7 +8,7 @@
 
 namespace deep_gemm::runtime {
 
-#if 0
+#if 1
 
 static void register_apis(pybind11::module_& m) {
     m.def("set_num_sms", [&](const int& new_num_sms) {
@@ -28,6 +28,12 @@ static void register_apis(pybind11::module_& m) {
     });
     m.def("get_pdl", [&]() {
         return device_runtime->get_pdl();
+    });
+    m.def("set_batch_invariant", [&](const bool& new_value) {
+        heuristics_runtime->set_batch_invariant(new_value);
+    });
+    m.def("get_batch_invariant", [&]() {
+        return heuristics_runtime->get_batch_invariant();
     });
     m.def("set_ignore_compile_dims", [&](const bool& new_value) {
         heuristics_runtime->set_ignore_compile_dims(new_value);

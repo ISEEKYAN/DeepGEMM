@@ -394,7 +394,7 @@ static void bf16_mega_moe(
         sym_buffer.zero_();
 }
 
-#if 0
+#if 1
 static void register_apis(pybind11::module_& m) {
 #if DG_TENSORMAP_COMPATIBLE
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);

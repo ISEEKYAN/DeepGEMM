@@ -62,7 +62,7 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
 
 #endif
 
-#if 0
+#if 1
 
 static void register_apis(pybind11::module_& m) {
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
