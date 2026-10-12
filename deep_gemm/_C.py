@@ -632,7 +632,7 @@ epilogue.BF16StochasticRounding = lambda: _torch_ops.epilogue_bf16_stochastic_ro
 
 
 # Memory homed in the GPU's locality domains, re-exported by `deep_gemm.locality_domain`
-locality_domain = types.ModuleType('deep_gemm._C.locality_domain', "Memory homed in the GPU's locality domains")
+locality_domain = types.ModuleType(f'{__name__}.locality_domain', "Memory homed in the GPU's locality domains")
 locality_domain.get_num_locality_domains = _torch_ops.locality_domain_get_num_locality_domains
 locality_domain.get_granularity = _torch_ops.locality_domain_get_granularity
 locality_domain.is_localization_available = _torch_ops.locality_domain_is_localization_available
@@ -642,7 +642,8 @@ locality_domain.is_localized = _torch_ops.locality_domain_is_localized
 locality_domain.get_sm_locality_domains = _torch_ops.locality_domain_get_sm_locality_domains
 locality_domain.get_balanced_sm_locality_domains = _torch_ops.locality_domain_get_balanced_sm_locality_domains
 locality_domain.release_mlopart = _torch_ops.locality_domain_release_mlopart
-# NOTES: registered so that `from ._C.locality_domain import ...` resolves as with the former pybind submodule
+# NOTES: registered so that `from ._C.locality_domain import ...` resolves as with the former pybind submodule,
+#        named after this module so the import also resolves when the package is vendored under another name
 sys.modules[locality_domain.__name__] = locality_domain
 
 
