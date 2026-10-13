@@ -36,7 +36,7 @@ def _bind_guarded_ops(*names):
     globals().update({name: getattr(_torch_ops, name) for name in names})
 
 
-init = _torch_ops.init
+_cpp_init = _torch_ops.init
 shutdown = _torch_ops.shutdown
 set_num_sms = _torch_ops.set_num_sms
 get_num_sms = _torch_ops.get_num_sms
@@ -51,6 +51,10 @@ cublaslt_gemm_nt = _torch_ops.cublaslt_gemm_nt
 cublaslt_gemm_nn = _torch_ops.cublaslt_gemm_nn
 cublaslt_gemm_tn = _torch_ops.cublaslt_gemm_tn
 cublaslt_gemm_tt = _torch_ops.cublaslt_gemm_tt
+
+
+def init(library_root_path):
+    _cpp_init(library_root_path, __package__)
 
 
 def set_block_size_multiple_of(value):
@@ -624,7 +628,7 @@ get_jit = _torch_ops.get_jit
 
 # GEMM epilogue classes for the `epilogue` argument, as `deep_gemm.epilogue.X`
 # NOTES: `alpha` and the FP8 `(d, sfd)` output pair are the shorthand for `Alpha` and `FP8Quantization`
-epilogue = types.ModuleType('deep_gemm.epilogue', 'GEMM epilogue classes')
+epilogue = types.ModuleType(f'{__package__}.epilogue', 'GEMM epilogue classes')
 epilogue.Identity = lambda: _torch_ops.epilogue_identity()
 epilogue.Alpha = lambda alpha: _torch_ops.epilogue_alpha(alpha)
 epilogue.FP8Quantization = lambda sfd: _torch_ops.epilogue_fp8_quantization(sfd)

@@ -3,12 +3,14 @@
 #include <torch/library.h>
 
 #include "../jit_kernels/heuristics/runtime.hpp"
+#include "../runtime/python_package.hpp"
 #include "../runtime/runtime.hpp"
 
 TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
     using namespace deep_gemm;
-    m.def("init(str library_root_path) -> ()", [&](const std::string& library_root_path) {
+    m.def("init(str library_root_path, str python_package_name='deep_gemm') -> ()", [&](const std::string& library_root_path, const std::string& python_package_name) {
         init_jit(library_root_path);
+        python_package::set_package_name(python_package_name);
     });
     m.def("shutdown() -> ()", []() {
         runtime = deep_jit::LazyInit<Runtime>(nullptr);
