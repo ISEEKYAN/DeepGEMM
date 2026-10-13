@@ -204,6 +204,10 @@ static bool is_localization_available() {
     return mlopart::is_available();
 }
 
+static void release(void* ptr) {
+    locality_domain_allocator.release(ptr);
+}
+
 static torch::stable::Device current_cuda_device() {
     int device_index = 0;
     DG_CUDA_RUNTIME_CHECK(cudaGetDevice(&device_index));
@@ -229,8 +233,6 @@ static std::vector<int64_t> contiguous_strides(const std::vector<int64_t>& sizes
     return strides;
 }
 
-// PyTorch 2.10's stable from_blob has no deleter callback. The process-wide allocator
-// therefore owns localized reservations until its destructor releases them at exit.
 static torch::stable::Tensor empty(const std::vector<int64_t>& sizes,
                                    const torch::headeronly::ScalarType& dtype,
                                    const int64_t& domain_idx) {
@@ -241,7 +243,7 @@ static torch::stable::Tensor empty(const std::vector<int64_t>& sizes,
     auto* ptr = allocator.reserve(num_bytes);
     allocator.map(ptr, num_bytes, static_cast<int>(domain_idx));
     return torch::stable::from_blob(
-        ptr, sizes, contiguous_strides(sizes), current_cuda_device(), dtype);
+        ptr, sizes, contiguous_strides(sizes), current_cuda_device(), dtype, release);
 }
 
 static torch::stable::Tensor empty_per_domain(const std::vector<int64_t>& sizes,
@@ -260,7 +262,7 @@ static torch::stable::Tensor empty_per_domain(const std::vector<int64_t>& sizes,
     std::vector<int64_t> strides = {num_slice_bytes / elem_size};
     const auto slice_strides = contiguous_strides(sizes);
     strides.insert(strides.end(), slice_strides.begin(), slice_strides.end());
-    return torch::stable::from_blob(ptr, full_sizes, strides, current_cuda_device(), dtype);
+    return torch::stable::from_blob(ptr, full_sizes, strides, current_cuda_device(), dtype, release);
 }
 
 static bool is_localized_op(const torch::stable::Tensor& tensor) {
