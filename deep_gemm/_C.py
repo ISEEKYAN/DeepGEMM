@@ -713,107 +713,17 @@ locality_domain.is_localization_available = _torch_ops.locality_domain_is_locali
 locality_domain.empty = lambda sizes, dtype, domain_idx: _torch_ops.locality_domain_empty(list(sizes), dtype, domain_idx)
 locality_domain.empty_per_domain = lambda sizes, dtype: _torch_ops.locality_domain_empty_per_domain(list(sizes), dtype)
 locality_domain.is_localized = _torch_ops.locality_domain_is_localized
-
-_NUM_SMS_PER_TPC = 2
-_NUM_PROBE_CHUNKS_PER_SM = 8
-_PROBE_CHUNK_BYTES = 4096
-_PROBE_LINE_BYTES = 128
-_CHAIN_LINE_STRIDE = 7
-_MIN_FAR_NEAR_RATIO = 1.25
-_NUM_MAX_PROBE_ATTEMPTS = 5
-_sm_locality_domains = None
-_balanced_sm_locality_domains = None
-
-
-def _get_even_sm_locality_domains():
-    tpc_idx = torch.arange(
-        get_num_sms() // _NUM_SMS_PER_TPC, dtype=torch.int32, device='cuda')
-    return (tpc_idx % locality_domain.get_num_locality_domains()).to(torch.uint8).repeat_interleave(_NUM_SMS_PER_TPC)
-
-
-def _get_probe_chain():
-    num_lines = _PROBE_CHUNK_BYTES // _PROBE_LINE_BYTES
-    words_per_line = _PROBE_LINE_BYTES // 4
-    chain = torch.zeros((num_lines, words_per_line), dtype=torch.int32, device='cuda')
-    chain[:, 0] = (torch.arange(num_lines, dtype=torch.int32, device='cuda') + _CHAIN_LINE_STRIDE) % num_lines * words_per_line
-    return chain.flatten()
-
-
-def _probe_sm_locality_domains_once(buffer):
-    num_domains, num_sms = buffer.size(0), buffer.size(1)
-    buffer.view(torch.int32).view(num_domains, -1, _PROBE_CHUNK_BYTES // 4).copy_(_get_probe_chain())
-    latency = torch.zeros(
-        (num_domains, num_sms, _NUM_PROBE_CHUNKS_PER_SM), dtype=torch.int16, device=buffer.device)
-    torch.zeros(256 << 20, dtype=torch.uint8, device=buffer.device)
-    _torch_ops.locality_domain_probe_chase(buffer, latency)
-    assert latency.gt(0).all().item()
-    latency = latency.to(torch.float32).median(-1).values
-    sorted_latency, order = latency.sort(0)
-    sm_domain = order[0].to(torch.uint8)
-    tpcs = sm_domain.view(-1, _NUM_SMS_PER_TPC)
-    clear = sorted_latency[1].ge(sorted_latency[0] * _MIN_FAR_NEAR_RATIO).all().item()
-    consistent = torch.equal(tpcs, tpcs.select(1, 0).unsqueeze(1).expand_as(tpcs))
-    return sm_domain if clear and consistent else None
-
-
-def _probe_sm_locality_domains():
-    num_sms = get_num_sms()
-    buffer = locality_domain.empty_per_domain(
-        (num_sms, _NUM_PROBE_CHUNKS_PER_SM, _PROBE_CHUNK_BYTES), torch.uint8)
-    for _ in range(_NUM_MAX_PROBE_ATTEMPTS):
-        result = _probe_sm_locality_domains_once(buffer)
-        if result is not None:
-            return result
-    return _get_even_sm_locality_domains()
-
-
-def _balance_sm_locality_domains(sm_domain):
-    tpcs = sm_domain.view(-1, _NUM_SMS_PER_TPC)
-    tpc_domain = tpcs.select(1, 0)
-    num_tpcs = tpcs.size(0)
-    assert num_tpcs % 2 == 0
-    larger = int(tpc_domain.sum().item() * 2 > num_tpcs)
-    surplus = (tpc_domain == larger).nonzero().flatten()[:num_tpcs // 2]
-    balanced = sm_domain.clone()
-    balanced.view(-1, _NUM_SMS_PER_TPC).index_fill_(0, surplus, larger ^ 1)
-    return balanced
-
-
-def _get_sm_locality_domains():
-    global _sm_locality_domains
-    if _sm_locality_domains is None:
-        _sm_locality_domains = (
-            _probe_sm_locality_domains()
-            if locality_domain.is_localization_available()
-            else _get_even_sm_locality_domains()
-        )
-    return _sm_locality_domains
-
-
-def _get_balanced_sm_locality_domains():
-    global _balanced_sm_locality_domains
-    if _balanced_sm_locality_domains is None:
-        _balanced_sm_locality_domains = _balance_sm_locality_domains(_get_sm_locality_domains())
-        _torch_ops.locality_domain_set_sm_locality_domains(
-            _sm_locality_domains, _balanced_sm_locality_domains)
-    return _balanced_sm_locality_domains
-
-
-def _release_mlopart():
-    _get_balanced_sm_locality_domains()
-    _torch_ops.locality_domain_release_mlopart()
-
-
-locality_domain.get_sm_locality_domains = _get_sm_locality_domains
-locality_domain.get_balanced_sm_locality_domains = _get_balanced_sm_locality_domains
-locality_domain.release_mlopart = _release_mlopart
+locality_domain.get_sm_locality_domains = _torch_ops.locality_domain_get_sm_locality_domains
+locality_domain.get_balanced_sm_locality_domains = _torch_ops.locality_domain_get_balanced_sm_locality_domains
+locality_domain.release_mlopart = _torch_ops.locality_domain_release_mlopart
 
 _cpp_init = init
 
 
 def init(library_root_path):
     _cpp_init(library_root_path, __package__)
-    _get_balanced_sm_locality_domains()
+
+
 # NOTES: registered so that `from ._C.locality_domain import ...` resolves as with the former pybind submodule,
 #        named after this module so the import also resolves when the package is vendored under another name
 sys.modules[locality_domain.__name__] = locality_domain
