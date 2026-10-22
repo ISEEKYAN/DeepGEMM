@@ -15,6 +15,7 @@
 #include <deep_gemm/ptx/tcgen05.cuh>
 #include <deep_gemm/ptx/tma.cuh>
 #include <deep_gemm/ptx/utils.cuh>
+#include <deep_gemm/impls/mega_moe_lora.cuh>
 
 namespace deep_gemm {
 
@@ -39,6 +40,7 @@ template <
     float kActivationBeta,
     bool kFastMath,
     typename weight_dtype_t,
+    uint32_t kLoRARank = 0,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -79,7 +81,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_acts_sf,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights_sf,
-                            const uint8_t* sm_locality_domains) {
+                            const uint8_t* sm_locality_domains,
+                            const uint64_t lora_xa_offset,
+                            nv_bfloat16* lora_xa_ring,
+                            const nv_bfloat16* lora_b_gate_up) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
@@ -582,6 +587,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto weight = *sym_buffer.map(
                 buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
                 current_rank_in_expert_idx);
+            if constexpr (kLoRARank > 0) {
+                mega_moe_lora::pull_xa<kLoRARank, kLoRARank * sizeof(nv_bfloat16)>(
+                    sym_buffer, lora_xa_offset, current_rank_in_expert_idx, src_token_idx,
+                    lora_xa_ring, pool_token_idx % kNumRingTokens, lane_idx);
+            }
 
             // Load and store SF (overlaps with last chunk's TMA load from remote)
             constexpr uint32_t kNumSFUint32 = kHidden / 128;
@@ -1110,6 +1120,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                         // Apply SwiGLU: gate * sigmoid(alpha * gate) * (up + beta)
                         auto fp32_values = reinterpret_cast<float2*>(store_block_raw_values[i]);
+                        if constexpr (kLoRARank > 0) {
+                            if (not task_info.is_shared()) {
+                                const uint32_t token_in_block = epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + (lane_idx % 4) * 2;
+                                const auto xa = lora_xa_ring + static_cast<uint64_t>(ring_m_idx + token_in_block) * kLoRARank;
+                                const auto b_row0 = lora_b_gate_up + (static_cast<uint64_t>(task_info.local_expert_idx) * L1_SHAPE_N
+                                                                      + n_idx + warp_idx_in_wg * 32 + lane_idx / 4) * kLoRARank;
+                                mega_moe_lora::add_delta<kLoRARank>(
+                                    *reinterpret_cast<float2(*)[4]>(fp32_values), xa, xa + kLoRARank,
+                                    token_in_block < valid_m, token_in_block + 1 < valid_m, b_row0);
+                            }
+                        }
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
                             auto bf16_gate = __float22bfloat162_rn(fp32_values[k * 2 + 0]);

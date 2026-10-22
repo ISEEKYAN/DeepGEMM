@@ -31,7 +31,8 @@ class SymmBuffer:
                  num_shared_experts: int = 0,
                  mma_type: str = 'fp8xfp4',
                  activation: str = 'swiglu',
-                 base: Optional['SymmBuffer'] = None):
+                 base: Optional['SymmBuffer'] = None,
+                 lora_rank: int = 0):
         # Align token count
         num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
 
@@ -55,6 +56,12 @@ class SymmBuffer:
             mma_type, activation,
             num_shared_experts
         )
+        # LoRA: per-token `xa` rows ([num_max_tokens_per_rank, lora_rank] BF16) after the kernel's layout, so
+        # dispatch can pull a token's `xa` from its source rank like its hidden row
+        self.lora_rank = lora_rank
+        self.lora_xa_offset = align(num_bytes, 128)
+        if lora_rank > 0:
+            num_bytes = self.lora_xa_offset + num_max_tokens_per_rank * lora_rank * 2
         if base is None:
             allocator = torch if group.size() == 1 else symm_mem
             self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
@@ -82,6 +89,11 @@ class SymmBuffer:
          self.shared_l2_acts, self.shared_l2_acts_sf,
          self.l1_acts, self.l1_acts_sf,
          self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
+        self.lora_xa = self.lora_xa_ring = None
+        if lora_rank > 0:
+            self.lora_xa = self.buffer[self.lora_xa_offset:num_bytes].view(torch.bfloat16).view(
+                num_max_tokens_per_rank, lora_rank)
+            self.lora_xa_ring = torch.empty((self.l1_acts.shape[0], lora_rank), dtype=torch.bfloat16, device='cuda')
 
     def destroy(self):
         self.handle = None
@@ -89,6 +101,8 @@ class SymmBuffer:
         self.group = None
         self.x = None
         self.x_sf = None
+        self.lora_xa = None
+        self.lora_xa_ring = None
 
 
 # TODO: remove this function
@@ -99,7 +113,8 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  num_shared_experts: int = 0,
                                  use_fp8_dispatch: Union[bool, None] = None,
                                  mma_type: str = 'fp8xfp4',
-                                 activation: str = 'swiglu') -> SymmBuffer:
+                                 activation: str = 'swiglu',
+                                 lora_rank: int = 0) -> SymmBuffer:
     # Backward compat: derive `mma_type` from `use_fp8_dispatch` if provided
     if use_fp8_dispatch is not None:
         assert use_fp8_dispatch == (mma_type.split('x')[0] == 'fp8')
@@ -113,7 +128,7 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
         num_shared_experts,
-        mma_type=mma_type, activation=activation
+        mma_type=mma_type, activation=activation, lora_rank=lora_rank
     )
 
 
@@ -173,6 +188,13 @@ def transform_weights_for_mega_moe(
 
 
 
+def transform_lora_b_for_mega_moe(lora_b_gate_up: torch.Tensor) -> torch.Tensor:
+    """Per-expert gate_up LoRA B ([experts, 2 * intermediate, rank], gate rows then up rows) in the L1 weights'
+    gate/up interleaved row order, as `fp8_fp4_mega_moe(lora_b_gate_up=...)` expects."""
+    assert lora_b_gate_up.dim() == 3 and lora_b_gate_up.dtype == torch.bfloat16
+    return _interleave_weights(lora_b_gate_up.contiguous())
+
+
 def fp8_fp4_mega_moe(y: torch.Tensor,
                      l1_weights: Tuple[torch.Tensor, torch.Tensor],
                      l2_weights: Tuple[torch.Tensor, torch.Tensor],
@@ -185,8 +207,14 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True,
                      activation_alpha: float = 1.0,
-                     activation_beta: float = 0.0):
+                     activation_beta: float = 0.0,
+                     lora_b_gate_up: Optional[torch.Tensor] = None):
+    """`lora_b_gate_up` (from `transform_lora_b_for_mega_moe`) enables the routed gate_up LoRA hook: each token's
+    `sym_buffer.lora_xa` row (`x A^T`, zero for tokens without an adapter) times B is added to the L1 accumulator
+    before its BF16 rounding. A zero delta leaves the output bits of the kernel without LoRA."""
     _validate_activation(activation)
+    lora_rank = 0 if lora_b_gate_up is None else sym_buffer.lora_rank
+    assert lora_b_gate_up is None or lora_rank > 0, 'The symmetric buffer was created without `lora_rank`'
     _C.fp8_fp4_mega_moe(
         y,
         l1_weights, l2_weights,
@@ -199,7 +227,9 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         recipe,
         activation, activation_clamp,
         fast_math,
-        activation_alpha, activation_beta
+        activation_alpha, activation_beta,
+        sym_buffer.lora_xa_ring if lora_rank > 0 else None,
+        lora_b_gate_up, sym_buffer.lora_xa_offset if lora_rank > 0 else 0, lora_rank
     )
 
 def bf16_mega_moe(y: torch.Tensor,

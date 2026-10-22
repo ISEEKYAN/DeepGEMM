@@ -510,6 +510,10 @@ def fp8_fp4_mega_moe(
     fast_math,
     activation_alpha,
     activation_beta,
+    lora_xa_ring=None,
+    lora_b_gate_up=None,
+    lora_xa_offset=0,
+    lora_rank=0,
 ):
     return _torch_ops.fp8_fp4_mega_moe(
         y,
@@ -534,6 +538,10 @@ def fp8_fp4_mega_moe(
         fast_math,
         activation_alpha,
         activation_beta,
+        lora_xa_ring,
+        lora_b_gate_up,
+        lora_xa_offset,
+        lora_rank,
     )
 
 
