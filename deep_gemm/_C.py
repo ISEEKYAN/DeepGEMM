@@ -514,6 +514,8 @@ def fp8_fp4_mega_moe(
     lora_b_gate_up=None,
     lora_xa_offset=0,
     lora_rank=0,
+    lora_b_shared_gate_up=None,
+    shared_lora_rank=0,
 ):
     return _torch_ops.fp8_fp4_mega_moe(
         y,
@@ -542,6 +544,8 @@ def fp8_fp4_mega_moe(
         lora_b_gate_up,
         lora_xa_offset,
         lora_rank,
+        lora_b_shared_gate_up,
+        shared_lora_rank,
     )
 
 

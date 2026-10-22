@@ -40,7 +40,9 @@ static void sm100_fp8_fp4_mega_moe(
     const int& lora_rank = 0,
     const int64_t& lora_xa_offset = 0,
     const std::optional<torch::stable::Tensor>& lora_xa_ring = std::nullopt,
-    const std::optional<torch::stable::Tensor>& lora_b_gate_up = std::nullopt
+    const std::optional<torch::stable::Tensor>& lora_b_gate_up = std::nullopt,
+    const int& shared_lora_rank = 0,
+    const std::optional<torch::stable::Tensor>& lora_b_shared_gate_up = std::nullopt
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -180,7 +182,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        {}
+        {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -202,7 +204,7 @@ static void __instantiate_kernel() {{
         to_string(activation_beta),
         fast_math ? "true" : "false",
         to_string(l1_weights.scalar_type()),
-        lora_rank));
+        lora_rank, shared_lora_rank));
 
     // Launch
     jit->launch(
@@ -237,7 +239,8 @@ static void __instantiate_kernel() {{
         sm_locality_domains.mutable_data_ptr<uint8_t>(),
         static_cast<uint64_t>(lora_xa_offset),
         lora_rank > 0 ? lora_xa_ring->mutable_data_ptr() : nullptr,
-        lora_rank > 0 ? lora_b_gate_up->mutable_data_ptr() : nullptr);
+        lora_rank > 0 ? lora_b_gate_up->mutable_data_ptr() : nullptr,
+        shared_lora_rank > 0 ? lora_b_shared_gate_up->mutable_data_ptr() : nullptr);
 }
 
 } // namespace deep_gemm

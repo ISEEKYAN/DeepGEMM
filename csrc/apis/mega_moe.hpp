@@ -286,7 +286,9 @@ static void fp8_fp4_mega_moe(
     const std::optional<torch::stable::Tensor>& lora_xa_ring = std::nullopt,
     const std::optional<torch::stable::Tensor>& lora_b_gate_up = std::nullopt,
     const int64_t& lora_xa_offset = 0,
-    const int& lora_rank = 0
+    const int& lora_rank = 0,
+    const std::optional<torch::stable::Tensor>& lora_b_shared_gate_up = std::nullopt,
+    const int& shared_lora_rank = 0
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -422,13 +424,24 @@ static void fp8_fp4_mega_moe(
             DG_HOST_ASSERT(lora_b_gate_up->dim() == 3 and lora_b_gate_up->size(0) == num_experts_per_rank and
                            lora_b_gate_up->size(1) == intermediate_hidden * 2 and lora_b_gate_up->size(2) == lora_rank);
         }
+        // The shared expert's gate (w1) / up (w3) adapters: `xa` row = [routed | w1 | w3], B interleaved like shared L1
+        if (shared_lora_rank > 0) {
+            DG_HOST_ASSERT(lora_rank > 0 and num_shared_experts > 0);
+            DG_HOST_ASSERT(shared_lora_rank % 8 == 0 and shared_lora_rank <= 64);
+            DG_HOST_ASSERT(torch_compat::nbytes(sym_buffer) >= static_cast<size_t>(
+                lora_xa_offset + static_cast<int64_t>(num_max_tokens_per_rank) * (lora_rank + 2 * shared_lora_rank) * 2));
+            DG_HOST_ASSERT(lora_b_shared_gate_up.has_value() and lora_b_shared_gate_up->is_contiguous() and
+                           lora_b_shared_gate_up->scalar_type() == torch::headeronly::ScalarType::BFloat16);
+            DG_HOST_ASSERT(lora_b_shared_gate_up->dim() == 2 and lora_b_shared_gate_up->size(0) == shared_intermediate_hidden * 2 and
+                           lora_b_shared_gate_up->size(1) == shared_lora_rank);
+        }
         if (activation == "situ") {
             launch(sm100_fp8_fp4_mega_moe_situ,
                    activation_alpha, activation_beta, fast_math);
         } else {
             launch(sm100_fp8_fp4_mega_moe,
                    activation_clamp, activation == "swiglustep", activation_alpha, activation_beta, fast_math,
-                   lora_rank, lora_xa_offset, lora_xa_ring, lora_b_gate_up);
+                   lora_rank, lora_xa_offset, lora_xa_ring, lora_b_gate_up, shared_lora_rank, lora_b_shared_gate_up);
         }
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
@@ -619,7 +632,9 @@ static void fp8_fp4_mega_moe(
     const std::optional<torch::stable::Tensor>& lora_xa_ring,
     const std::optional<torch::stable::Tensor>& lora_b_gate_up,
     const int64_t& lora_xa_offset,
-    const int64_t& lora_rank) {
+    const int64_t& lora_rank,
+    const std::optional<torch::stable::Tensor>& lora_b_shared_gate_up,
+    const int64_t& shared_lora_rank) {
     mega::fp8_fp4_mega_moe(
         y, {l1_weights_tuple, l1_weights_tuple_sf}, {l2_weights_tuple, l2_weights_tuple_sf},
         make_optional_tensor_pair(shared_l1_weights_tuple_opt, shared_l1_weights_tuple_opt_sf),
@@ -629,7 +644,8 @@ static void fp8_fp4_mega_moe(
         mega::checked_int(num_experts), mega::checked_int(num_topk), checked_recipe(recipe),
         activation, activation_clamp_opt, fast_math,
         static_cast<float>(activation_alpha), static_cast<float>(activation_beta),
-        lora_xa_ring, lora_b_gate_up, lora_xa_offset, mega::checked_int(lora_rank));
+        lora_xa_ring, lora_b_gate_up, lora_xa_offset, mega::checked_int(lora_rank),
+        lora_b_shared_gate_up, mega::checked_int(shared_lora_rank));
 }
 
 static void bf16_mega_moe(
@@ -684,7 +700,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
     m.def("get_symm_buffer_size_for_mega_moe(int num_ranks, int num_experts, int num_max_tokens_per_rank, int num_topk, int hidden, int intermediate_hidden, str mma_type, str activation, int num_shared_experts) -> (int, int[])");
     m.def("_slice_symm_buffer_for_mega_moe(Tensor(a) buffer, int[] layout_info) -> (Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a))");
 
-    m.def("fp8_fp4_mega_moe(Tensor(a!) y, Tensor l1_weights_tuple, Tensor l1_weights_tuple_sf, Tensor l2_weights_tuple, Tensor l2_weights_tuple_sf, Tensor? shared_l1_weights_tuple_opt, Tensor? shared_l1_weights_tuple_opt_sf, Tensor? shared_l2_weights_tuple_opt, Tensor? shared_l2_weights_tuple_opt_sf, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, int[3] recipe, str activation, float? activation_clamp_opt, bool fast_math, float activation_alpha, float activation_beta, Tensor? lora_xa_ring=None, Tensor? lora_b_gate_up=None, int lora_xa_offset=0, int lora_rank=0) -> ()");
+    m.def("fp8_fp4_mega_moe(Tensor(a!) y, Tensor l1_weights_tuple, Tensor l1_weights_tuple_sf, Tensor l2_weights_tuple, Tensor l2_weights_tuple_sf, Tensor? shared_l1_weights_tuple_opt, Tensor? shared_l1_weights_tuple_opt_sf, Tensor? shared_l2_weights_tuple_opt, Tensor? shared_l2_weights_tuple_opt_sf, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, int[3] recipe, str activation, float? activation_clamp_opt, bool fast_math, float activation_alpha, float activation_beta, Tensor? lora_xa_ring=None, Tensor? lora_b_gate_up=None, int lora_xa_offset=0, int lora_rank=0, Tensor? lora_b_shared_gate_up=None, int shared_lora_rank=0) -> ()");
     m.def("bf16_mega_moe(Tensor(a!) y, Tensor l1_weights, Tensor l2_weights, Tensor? shared_l1_weights_opt, Tensor? shared_l2_weights_opt, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, str activation, float? activation_clamp_opt, bool fast_math, float activation_alpha, float activation_beta) -> ()");
 }
 

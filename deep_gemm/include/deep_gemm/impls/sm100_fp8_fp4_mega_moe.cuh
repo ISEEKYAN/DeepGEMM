@@ -41,6 +41,7 @@ template <
     bool kFastMath,
     typename weight_dtype_t,
     uint32_t kLoRARank = 0,
+    uint32_t kSharedLoRARank = 0,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -84,7 +85,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const uint8_t* sm_locality_domains,
                             const uint64_t lora_xa_offset,
                             nv_bfloat16* lora_xa_ring,
-                            const nv_bfloat16* lora_b_gate_up) {
+                            const nv_bfloat16* lora_b_gate_up,
+                            const nv_bfloat16* lora_b_shared_gate_up) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
@@ -588,7 +590,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
                 current_rank_in_expert_idx);
             if constexpr (kLoRARank > 0) {
-                mega_moe_lora::pull_xa<kLoRARank, kLoRARank * sizeof(nv_bfloat16)>(
+                mega_moe_lora::pull_xa<kLoRARank, (kLoRARank + 2 * kSharedLoRARank) * sizeof(nv_bfloat16)>(
                     sym_buffer, lora_xa_offset, current_rank_in_expert_idx, src_token_idx,
                     lora_xa_ring, pool_token_idx % kNumRingTokens, lane_idx);
             }
@@ -1128,6 +1130,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                                                       + n_idx + warp_idx_in_wg * 32 + lane_idx / 4) * kLoRARank;
                                 mega_moe_lora::add_delta<kLoRARank>(
                                     *reinterpret_cast<float2(*)[4]>(fp32_values), xa, xa + kLoRARank,
+                                    token_in_block < valid_m, token_in_block + 1 < valid_m, b_row0);
+                            }
+                        }
+                        if constexpr (kSharedLoRARank > 0) {
+                            if (task_info.is_shared()) {
+                                // Shared tokens are this rank's own: read their `xa` rows in place
+                                constexpr uint32_t kRowElems = kLoRARank + 2 * kSharedLoRARank;
+                                const uint32_t token_in_block = epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + (lane_idx % 4) * 2;
+                                const auto xa = reinterpret_cast<const nv_bfloat16*>(
+                                    sym_buffer.template get_base_ptr<uint8_t*>() + lora_xa_offset) +
+                                    static_cast<uint64_t>(pool_m_idx + token_in_block) * kRowElems + kLoRARank;
+                                const auto b_row0 = lora_b_shared_gate_up +
+                                    static_cast<uint64_t>(n_idx + warp_idx_in_wg * 32 + lane_idx / 4) * kSharedLoRARank;
+                                mega_moe_lora::add_delta<kSharedLoRARank, kSharedLoRARank>(
+                                    *reinterpret_cast<float2(*)[4]>(fp32_values), xa, xa + kRowElems,
                                     token_in_block < valid_m, token_in_block + 1 < valid_m, b_row0);
                             }
                         }

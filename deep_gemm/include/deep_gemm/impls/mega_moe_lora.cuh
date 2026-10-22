@@ -9,13 +9,15 @@ namespace deep_gemm::mega_moe_lora {
 //
 // Routed experts use the shared-outer layout: gate_up A is shared by all experts (applied outside the kernel,
 // `xa = x A^T` per source token, BF16), gate_up B is per expert. Each source token's `xa` row sits in the
-// symmetric buffer at `lora_xa_offset`; dispatch copies it next to the pulled token, and the L1 epilogue adds
+// symmetric buffer at `lora_xa_offset` (routed `xa`, then the shared expert's w1 and w3 `xa`); dispatch copies
+// the routed part next to the pulled token, and the L1 epilogue adds
 //   d = sum_{r = 0 .. R-1} xa[r] * B_e[n, r]      (FP32 FMA chain, r ascending)
 // to the FP32 accumulator before its BF16 rounding. A zero `d` keeps the accumulator bits unchanged (including
 // -0), so rows without an adapter (`xa == 0`) and zero adapters (`B == 0`) give the kernel's bits without LoRA.
+// The shared expert's w1 / w3 adapters are separate: its gate rows read the w1 `xa` and B, its up rows the w3 ones.
 
 // Dispatch: copy the routed `xa` row of a pulled token from its source rank into the local ring slot.
-template <uint32_t kRank, uint32_t kRowBytes, typename sym_buffer_t>
+template <uint32_t kRank, uint64_t kRowBytes, typename sym_buffer_t>
 CUTLASS_DEVICE void pull_xa(const sym_buffer_t& sym_buffer, const uint64_t& lora_xa_offset,
                             const uint32_t& src_rank_idx, const uint32_t& src_token_idx,
                             nv_bfloat16* lora_xa_ring, const uint32_t& ring_token_idx,
@@ -30,9 +32,11 @@ CUTLASS_DEVICE void pull_xa(const sym_buffer_t& sym_buffer, const uint64_t& lora
 }
 
 // L1 epilogue: `values[q]` holds TMEM lane `row0 + 8 q` (weight row) for the thread's two tokens (`.x`, `.y`), as
-// loaded by two `SM100_TMEM_LOAD_16dp256b1x`. `b_row0` points at B row `row0` (row stride `kRank`), `xa_0/1` at the
-// two tokens' `xa` rows. Tokens past the block's valid rows are left untouched.
-template <uint32_t kRank>
+// loaded by two `SM100_TMEM_LOAD_16dp256b1x`; with the granularity-8 gate/up interleave, q = 0, 2 are gate rows and
+// q = 1, 3 up rows. `b_row0` points at B row `row0` (row stride `kRank`), `xa_0/1` at the two tokens' `xa`; up rows
+// read `xa` from `kUpOffset` on (0 for routed experts, the w1 rank for the shared expert). Tokens past the block's
+// valid rows are left untouched.
+template <uint32_t kRank, uint32_t kUpOffset = 0>
 CUTLASS_DEVICE void add_delta(float2 (&values)[4],
                               const nv_bfloat16* xa_0, const nv_bfloat16* xa_1,
                               const bool& valid_0, const bool& valid_1,
@@ -41,12 +45,13 @@ CUTLASS_DEVICE void add_delta(float2 (&values)[4],
     float d[4][2] = {};
     #pragma unroll
     for (uint32_t c = 0; c < kRank / 8; ++ c) {
-        const uint4 x0 = __ldg(reinterpret_cast<const uint4*>(xa_0) + c);
-        const uint4 x1 = __ldg(reinterpret_cast<const uint4*>(xa_1) + c);
-        const auto* x0h = reinterpret_cast<const __nv_bfloat162*>(&x0);
-        const auto* x1h = reinterpret_cast<const __nv_bfloat162*>(&x1);
         #pragma unroll
         for (uint32_t q = 0; q < 4; ++ q) {
+            const uint32_t xa_offset = q % 2 == 1 ? kUpOffset : 0;
+            const uint4 x0 = __ldg(reinterpret_cast<const uint4*>(xa_0 + xa_offset) + c);
+            const uint4 x1 = __ldg(reinterpret_cast<const uint4*>(xa_1 + xa_offset) + c);
+            const auto* x0h = reinterpret_cast<const __nv_bfloat162*>(&x0);
+            const auto* x1h = reinterpret_cast<const __nv_bfloat162*>(&x1);
             const uint4 b = __ldg(reinterpret_cast<const uint4*>(b_row0 + 8 * q * kRank) + c);
             const auto* bh = reinterpret_cast<const __nv_bfloat162*>(&b);
             #pragma unroll
