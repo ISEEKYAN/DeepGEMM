@@ -1113,6 +1113,26 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     wait_and_prefetch_next(s, num_valid_store_blocks, raw_values);
                     auto& store_block_raw_values = raw_values[s % (kNumPrefetchStages + 1)];
 
+                    // LoRA: gate_up delta of the whole store block, into the FP32 values before their BF16 rounding
+                    if constexpr (kLoRARank > 0) {
+                        const uint32_t token0 = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M_L1 + (lane_idx % 4) * 2;
+                        const uint32_t row0 = n_idx + warp_idx_in_wg * 32 + lane_idx / 4;
+                        if (not task_info.is_shared()) {
+                            mega_moe_lora::add_delta<kLoRARank, kNumAtomsPerStore, kLoRARank>(
+                                store_block_raw_values, lora_xa_ring + static_cast<uint64_t>(ring_m_idx) * kLoRARank,
+                                token0, valid_m,
+                                lora_b_gate_up + (static_cast<uint64_t>(task_info.local_expert_idx) * L1_SHAPE_N + row0) * kLoRARank);
+                        } else if constexpr (kSharedLoRARank > 0) {
+                            // Shared tokens are this rank's own: their `xa` rows in place, w1 / w3 parts after the routed
+                            constexpr uint32_t kRowElems = kLoRARank + 2 * kSharedLoRARank;
+                            mega_moe_lora::add_delta<kSharedLoRARank, kNumAtomsPerStore, kRowElems, kSharedLoRARank>(
+                                store_block_raw_values,
+                                reinterpret_cast<const nv_bfloat16*>(sym_buffer.template get_base_ptr<uint8_t*>() + lora_xa_offset) +
+                                    static_cast<uint64_t>(pool_m_idx) * kRowElems + kLoRARank,
+                                token0, valid_m, lora_b_shared_gate_up + static_cast<uint64_t>(row0) * kSharedLoRARank);
+                        }
+                    }
+
                     // Iterate all atoms in the store block
                     float2 activation_values[kNumAtomsPerStore][2];
                     float2 amax_values[kNumAtomsPerStore];
@@ -1137,32 +1157,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                         // Apply SwiGLU: gate * sigmoid(alpha * gate) * (up + beta)
                         auto fp32_values = reinterpret_cast<float2*>(store_block_raw_values[i]);
-                        if constexpr (kLoRARank > 0) {
-                            if (not task_info.is_shared()) {
-                                const uint32_t token_in_block = epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + (lane_idx % 4) * 2;
-                                const auto xa = lora_xa_ring + static_cast<uint64_t>(ring_m_idx + token_in_block) * kLoRARank;
-                                const auto b_row0 = lora_b_gate_up + (static_cast<uint64_t>(task_info.local_expert_idx) * L1_SHAPE_N
-                                                                      + n_idx + warp_idx_in_wg * 32 + lane_idx / 4) * kLoRARank;
-                                mega_moe_lora::add_delta<kLoRARank>(
-                                    *reinterpret_cast<float2(*)[4]>(fp32_values), xa, xa + kLoRARank,
-                                    token_in_block < valid_m, token_in_block + 1 < valid_m, b_row0);
-                            }
-                        }
-                        if constexpr (kSharedLoRARank > 0) {
-                            if (task_info.is_shared()) {
-                                // Shared tokens are this rank's own: read their `xa` rows in place
-                                constexpr uint32_t kRowElems = kLoRARank + 2 * kSharedLoRARank;
-                                const uint32_t token_in_block = epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + (lane_idx % 4) * 2;
-                                const auto xa = reinterpret_cast<const nv_bfloat16*>(
-                                    sym_buffer.template get_base_ptr<uint8_t*>() + lora_xa_offset) +
-                                    static_cast<uint64_t>(pool_m_idx + token_in_block) * kRowElems + kLoRARank;
-                                const auto b_row0 = lora_b_shared_gate_up +
-                                    static_cast<uint64_t>(n_idx + warp_idx_in_wg * 32 + lane_idx / 4) * kSharedLoRARank;
-                                mega_moe_lora::add_delta<kSharedLoRARank, kSharedLoRARank>(
-                                    *reinterpret_cast<float2(*)[4]>(fp32_values), xa, xa + kRowElems,
-                                    token_in_block < valid_m, token_in_block + 1 < valid_m, b_row0);
-                            }
-                        }
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
                             auto bf16_gate = __float22bfloat162_rn(fp32_values[k * 2 + 0]);
