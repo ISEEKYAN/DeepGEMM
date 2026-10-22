@@ -31,64 +31,59 @@ CUTLASS_DEVICE void pull_xa(const sym_buffer_t& sym_buffer, const uint64_t& lora
         reinterpret_cast<uint32_t*>(lora_xa_ring + static_cast<uint64_t>(ring_token_idx) * kRank)[lane_idx] = remote_row[lane_idx];
 }
 
-// L1 epilogue, for all `kNumAtoms` 8-token atoms of a store block at once: atom `a`'s `values[a]` (8 FP32, as loaded
-// by two `SM100_TMEM_LOAD_16dp256b1x`) hold TMEM lanes `row0 + 8 q` (weight rows, as float2 `q`) for the thread's two
-// tokens (`.x`, `.y`) `token0 + 8 a` and `+ 1`. With the granularity-8 gate/up interleave, q = 0, 2 are gate rows and
+// L1 epilogue, for the `kNumAtoms` 8-token atoms of a store block: atom `a`'s `values[a]` (8 FP32, as loaded by two
+// `SM100_TMEM_LOAD_16dp256b1x`) hold TMEM lanes `row0 + 8 q` (weight rows, as float2 `q`) for the thread's two tokens
+// (`.x`, `.y`) `token0 + 8 a` and `+ 1`. With the granularity-8 gate/up interleave, q = 0, 2 are gate rows and
 // q = 1, 3 up rows; up rows read `xa` from `kUpOffset` on (0 for routed experts, the w1 rank for the shared expert).
 // `b_row0` points at B row `row0` (row stride `kRank`), `xa` at token row 0 of the block (row stride `kXaStride`).
-// Rank chunks are the outer loop, so each B chunk is loaded once per store block; every value's FMA chain still runs
-// in ascending r. Tokens from `num_valid_tokens` on are left untouched.
+// One atom at a time and a rolled rank-chunk loop keep few registers live (the kernel runs at 128 per thread);
+// every value's FMA chain runs in ascending r. Tokens from `num_valid_tokens` on are left untouched.
 template <uint32_t kRank, uint32_t kNumAtoms, uint32_t kXaStride, uint32_t kUpOffset = 0>
 CUTLASS_DEVICE void add_delta(uint32_t (&values)[kNumAtoms][8],
                               const nv_bfloat16* xa, const uint32_t& token0, const uint32_t& num_valid_tokens,
                               const nv_bfloat16* b_row0) {
     static_assert(kRank % 8 == 0, "Invalid LoRA rank");
     constexpr uint32_t kNumXa = kUpOffset == 0 ? 1 : 2;
-    float d[kNumAtoms][4][2] = {};
     #pragma unroll
-    for (uint32_t c = 0; c < kRank / 8; ++ c) {
-        float2 bf[4][4];
-        #pragma unroll
-        for (uint32_t q = 0; q < 4; ++ q) {
-            const uint4 b = __ldg(reinterpret_cast<const uint4*>(b_row0 + 8 * q * kRank) + c);
+    for (uint32_t a = 0; a < kNumAtoms; ++ a) {
+        if (token0 + 8 * a >= num_valid_tokens)
+            continue;
+        float d[4][2] = {};
+        #pragma unroll 1
+        for (uint32_t c = 0; c < kRank / 8; ++ c) {
+            uint4 b[4], x[2][kNumXa];
             #pragma unroll
-            for (uint32_t k = 0; k < 4; ++ k)
-                bf[q][k] = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(&b)[k]);
-        }
-        #pragma unroll
-        for (uint32_t a = 0; a < kNumAtoms; ++ a) {
+            for (uint32_t q = 0; q < 4; ++ q)
+                b[q] = __ldg(reinterpret_cast<const uint4*>(b_row0 + 8 * q * kRank) + c);
             #pragma unroll
             for (uint32_t t = 0; t < 2; ++ t) {
-                const auto row = xa + static_cast<uint64_t>(token0 + 8 * a + t) * kXaStride;
-                float2 xf[kNumXa][4];
                 #pragma unroll
-                for (uint32_t h = 0; h < kNumXa; ++ h) {
-                    const uint4 x = __ldg(reinterpret_cast<const uint4*>(row + h * kUpOffset) + c);
-                    #pragma unroll
-                    for (uint32_t k = 0; k < 4; ++ k)
-                        xf[h][k] = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(&x)[k]);
-                }
+                for (uint32_t h = 0; h < kNumXa; ++ h)
+                    x[t][h] = __ldg(reinterpret_cast<const uint4*>(
+                        xa + static_cast<uint64_t>(token0 + 8 * a + t) * kXaStride + h * kUpOffset) + c);
+            }
+            #pragma unroll
+            for (uint32_t q = 0; q < 4; ++ q) {
                 #pragma unroll
-                for (uint32_t q = 0; q < 4; ++ q) {
-                    const auto& x = xf[kNumXa == 2 ? q % 2 : 0];
+                for (uint32_t k = 0; k < 4; ++ k) {
+                    const float2 bf = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(&b[q])[k]);
                     #pragma unroll
-                    for (uint32_t k = 0; k < 4; ++ k) {
-                        d[a][q][t] = fmaf(x[k].x, bf[q][k].x, d[a][q][t]);
-                        d[a][q][t] = fmaf(x[k].y, bf[q][k].y, d[a][q][t]);
+                    for (uint32_t t = 0; t < 2; ++ t) {
+                        const float2 xf = __bfloat1622float2(
+                            reinterpret_cast<const __nv_bfloat162*>(&x[t][kNumXa == 2 ? q % 2 : 0])[k]);
+                        d[q][t] = fmaf(xf.x, bf.x, d[q][t]);
+                        d[q][t] = fmaf(xf.y, bf.y, d[q][t]);
                     }
                 }
             }
         }
-    }
-    #pragma unroll
-    for (uint32_t a = 0; a < kNumAtoms; ++ a) {
         auto v = reinterpret_cast<float2*>(values[a]);
         #pragma unroll
         for (uint32_t q = 0; q < 4; ++ q) {
-            if (token0 + 8 * a < num_valid_tokens and d[a][q][0] != 0.0f)
-                v[q].x += d[a][q][0];
-            if (token0 + 8 * a + 1 < num_valid_tokens and d[a][q][1] != 0.0f)
-                v[q].y += d[a][q][1];
+            if (d[q][0] != 0.0f)
+                v[q].x += d[q][0];
+            if (token0 + 8 * a + 1 < num_valid_tokens and d[q][1] != 0.0f)
+                v[q].y += d[q][1];
         }
     }
 }
