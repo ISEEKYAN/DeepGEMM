@@ -42,7 +42,11 @@ static void sm100_fp8_fp4_mega_moe(
     const std::optional<torch::stable::Tensor>& lora_xa_ring = std::nullopt,
     const std::optional<torch::stable::Tensor>& lora_b_gate_up = std::nullopt,
     const int& shared_lora_rank = 0,
-    const std::optional<torch::stable::Tensor>& lora_b_shared_gate_up = std::nullopt
+    const std::optional<torch::stable::Tensor>& lora_b_shared_gate_up = std::nullopt,
+    const std::optional<torch::stable::Tensor>& lora_act = std::nullopt,
+    const std::optional<torch::stable::Tensor>& lora_shared_act = std::nullopt,
+    const std::optional<torch::stable::Tensor>& lora_pool_meta = std::nullopt,
+    const std::optional<torch::stable::Tensor>& lora_expert_info = std::nullopt
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -240,7 +244,11 @@ static void __instantiate_kernel() {{
         static_cast<uint64_t>(lora_xa_offset),
         lora_rank > 0 ? lora_xa_ring->mutable_data_ptr() : nullptr,
         lora_rank > 0 ? lora_b_gate_up->mutable_data_ptr() : nullptr,
-        shared_lora_rank > 0 ? lora_b_shared_gate_up->mutable_data_ptr() : nullptr);
+        shared_lora_rank > 0 ? lora_b_shared_gate_up->mutable_data_ptr() : nullptr,
+        lora_rank > 0 ? lora_act->mutable_data_ptr() : nullptr,
+        shared_lora_rank > 0 ? lora_shared_act->mutable_data_ptr() : nullptr,
+        lora_rank > 0 ? lora_pool_meta->mutable_data_ptr() : nullptr,
+        lora_rank > 0 ? lora_expert_info->mutable_data_ptr() : nullptr);
 }
 
 } // namespace deep_gemm

@@ -86,7 +86,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const uint64_t lora_xa_offset,
                             nv_bfloat16* lora_xa_ring,
                             const nv_bfloat16* lora_b_gate_up,
-                            const nv_bfloat16* lora_b_shared_gate_up) {
+                            const nv_bfloat16* lora_b_shared_gate_up,
+                            nv_bfloat16* lora_act,
+                            nv_bfloat16* lora_shared_act,
+                            uint32_t* lora_pool_meta,
+                            uint32_t* lora_expert_info) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
@@ -621,6 +625,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Write source metadata for combine write-back (logical pool token)
                 *workspace.get_token_src_metadata_ptr(pool_token_idx) =
                     {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
+                if constexpr (kLoRARank > 0) {
+                    // Down LoRA: the pool row's source survives the workspace clean
+                    const auto meta = lora_pool_meta + static_cast<uint64_t>(pool_token_idx) * 3;
+                    meta[0] = current_rank_in_expert_idx, meta[1] = src_token_idx, meta[2] = src_topk_idx;
+                }
 
                 // Complete last chunk's store
                 issue_and_wait_pull_store(kNumChunks - 1);
@@ -671,6 +680,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Clean expert token count, and add cumulative results
                 DG_STATIC_ASSERT(kNumDispatchWarps >= 2, "Not enough dispatch warps");
                 if (warp_idx == 0) {
+                    if constexpr (kLoRARank > 0) {
+                        // Down LoRA: this expert's pool rows are [start, start + count)
+                        if (cute::elect_one_sync())
+                            lora_expert_info[i * 2] = expert_pool_block_offset * BLOCK_M, lora_expert_info[i * 2 + 1] = num_recv_tokens;
+                        __syncwarp();
+                    }
                     *workspace.get_expert_recv_count_sum_ptr(i) = 0;
                 } else if (warp_idx == 1) {
                     if (cute::elect_one_sync() and cumulative_local_expert_recv_stats != nullptr)
@@ -1185,6 +1200,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 up = __fadd2_rn(up, {kActivationBeta, kActivationBeta});
                             activation_values[i][k] = __fmul2_rn(
                                 __fmul2_rn(gated, up), weights);
+                        }
+                        if constexpr (kLoRARank > 0) {
+                            // Down LoRA input: BF16 activation, pool row (routed) or token row (shared)
+                            const uint32_t token_in_block = epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + (lane_idx % 4) * 2;
+                            const uint32_t col0 = n_block_idx * L1_OUT_BLOCK_N + warp_idx_in_wg * 16 + lane_idx / 4;
+                            if (not task_info.is_shared()) {
+                                mega_moe_lora::export_act<kIntermediateHidden>(
+                                    lora_act, activation_values[i], col0, pool_m_idx + token_in_block,
+                                    token_in_block < valid_m, token_in_block + 1 < valid_m);
+                            } else if constexpr (kSharedLoRARank > 0) {
+                                mega_moe_lora::export_act<kIntermediateHidden * kNumSharedExperts>(
+                                    lora_shared_act, activation_values[i], col0, pool_m_idx + token_in_block,
+                                    token_in_block < valid_m, token_in_block + 1 < valid_m);
+                            }
                         }
 
                         // Amax reduction (thread-level)

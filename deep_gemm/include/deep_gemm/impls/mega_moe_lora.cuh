@@ -75,4 +75,18 @@ CUTLASS_DEVICE void add_delta(float2 (&values)[4],
     }
 }
 
+// L1 epilogue, down LoRA input: store the BF16 activation (SwiGLU x top-k weight, before the FP8 cast) of the
+// thread's two tokens and two intermediate columns (`act[k]` = column `col0 + 8 k`), rows `row_0` / `row_1` of `out`.
+template <uint32_t kRowElems>
+CUTLASS_DEVICE void export_act(nv_bfloat16* out, const float2 (&act)[2], const uint32_t& col0,
+                               const uint64_t& row_0, const bool& valid_0, const bool& valid_1) {
+    #pragma unroll
+    for (uint32_t k = 0; k < 2; ++ k) {
+        if (valid_0)
+            out[row_0 * kRowElems + col0 + 8 * k] = __float2bfloat16_rn(act[k].x);
+        if (valid_1)
+            out[(row_0 + 1) * kRowElems + col0 + 8 * k] = __float2bfloat16_rn(act[k].y);
+    }
+}
+
 } // namespace deep_gemm::mega_moe_lora

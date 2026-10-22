@@ -97,6 +97,18 @@ class SymmBuffer:
             self.lora_xa = self.buffer[self.lora_xa_offset:num_bytes].view(torch.bfloat16).view(
                 num_max_tokens_per_rank, lora_row)
             self.lora_xa_ring = torch.empty((self.l1_acts.shape[0], lora_rank), dtype=torch.bfloat16, device='cuda')
+            # Down LoRA inputs exported by the kernel: BF16 activations of the routed pool rows (worst-case pool
+            # size) and of the shared expert's token rows, each pool row's (rank, token, topk), and per local
+            # expert its pool rows [start, start + count)
+            num_experts_per_rank = num_experts // group.size()
+            num_max_pool_tokens = _get_num_max_pool_tokens(
+                group.size(), num_max_tokens_per_rank, num_topk, num_experts_per_rank)
+            self.lora_act = torch.empty((num_max_pool_tokens, intermediate_hidden), dtype=torch.bfloat16, device='cuda')
+            self.lora_pool_meta = torch.empty((num_max_pool_tokens, 3), dtype=torch.int, device='cuda')
+            self.lora_expert_info = torch.empty((num_experts_per_rank, 2), dtype=torch.int, device='cuda')
+            self.lora_shared_act = torch.empty(
+                (num_max_tokens_per_rank, intermediate_hidden * num_shared_experts),
+                dtype=torch.bfloat16, device='cuda') if shared_lora_rank > 0 else None
 
     def destroy(self):
         self.handle = None
@@ -106,6 +118,7 @@ class SymmBuffer:
         self.x_sf = None
         self.lora_xa = None
         self.lora_xa_ring = None
+        self.lora_act = self.lora_shared_act = self.lora_pool_meta = self.lora_expert_info = None
 
 
 # TODO: remove this function
@@ -134,6 +147,13 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
         num_shared_experts,
         mma_type=mma_type, activation=activation, lora_rank=lora_rank, shared_lora_rank=shared_lora_rank
     )
+
+
+def _get_num_max_pool_tokens(num_ranks: int, num_max_tokens_per_rank: int, num_topk: int,
+                             num_experts_per_rank: int) -> int:
+    # As `layout::get_num_max_pool_tokens` (max candidate BLOCK_M 240, their LCM 1920)
+    num_max_recv_tokens = num_ranks * num_max_tokens_per_rank
+    return align(num_max_recv_tokens * min(num_topk, num_experts_per_rank) + num_experts_per_rank * 239, 1920)
 
 
 def _interleave_weights(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
@@ -248,7 +268,9 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         activation_alpha, activation_beta,
         sym_buffer.lora_xa_ring if lora_rank > 0 else None,
         lora_b_gate_up, sym_buffer.lora_xa_offset if lora_rank > 0 else 0, lora_rank,
-        lora_b_shared_gate_up, sym_buffer.shared_lora_rank if lora_b_shared_gate_up is not None else 0
+        lora_b_shared_gate_up, sym_buffer.shared_lora_rank if lora_b_shared_gate_up is not None else 0,
+        *((sym_buffer.lora_act, sym_buffer.lora_shared_act, sym_buffer.lora_pool_meta, sym_buffer.lora_expert_info)
+          if lora_rank > 0 else (None, None, None, None))
     )
 
 def bf16_mega_moe(y: torch.Tensor,

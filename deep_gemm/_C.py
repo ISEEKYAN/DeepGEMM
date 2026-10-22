@@ -516,6 +516,10 @@ def fp8_fp4_mega_moe(
     lora_rank=0,
     lora_b_shared_gate_up=None,
     shared_lora_rank=0,
+    lora_act=None,
+    lora_shared_act=None,
+    lora_pool_meta=None,
+    lora_expert_info=None,
 ):
     return _torch_ops.fp8_fp4_mega_moe(
         y,
@@ -546,6 +550,10 @@ def fp8_fp4_mega_moe(
         lora_rank,
         lora_b_shared_gate_up,
         shared_lora_rank,
+        lora_act,
+        lora_shared_act,
+        lora_pool_meta,
+        lora_expert_info,
     )
 
 
