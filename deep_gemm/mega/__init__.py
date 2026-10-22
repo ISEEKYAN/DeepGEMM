@@ -63,8 +63,11 @@ class SymmBuffer:
         self.lora_rank, self.shared_lora_rank = lora_rank, shared_lora_rank
         self.lora_xa_offset = align(num_bytes, 128)
         lora_row = lora_rank + 2 * shared_lora_rank
+        # Then `lora_ret` [num_topk, num_max_tokens_per_rank, lora_rank] BF16: where the down LoRA's per-slot `A_e a`
+        # rows are written back to their token's rank (by the caller, after the kernel)
+        self.lora_ret_offset = align(self.lora_xa_offset + num_max_tokens_per_rank * lora_row * 2, 128)
         if lora_rank > 0:
-            num_bytes = self.lora_xa_offset + num_max_tokens_per_rank * lora_row * 2
+            num_bytes = self.lora_ret_offset + num_topk * num_max_tokens_per_rank * lora_rank * 2
         if base is None:
             allocator = torch if group.size() == 1 else symm_mem
             self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
@@ -92,10 +95,14 @@ class SymmBuffer:
          self.shared_l2_acts, self.shared_l2_acts_sf,
          self.l1_acts, self.l1_acts_sf,
          self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
-        self.lora_xa = self.lora_xa_ring = None
+        self.lora_xa = self.lora_xa_ring = self.lora_ret = self.lora_peer_bases = None
         if lora_rank > 0:
-            self.lora_xa = self.buffer[self.lora_xa_offset:num_bytes].view(torch.bfloat16).view(
-                num_max_tokens_per_rank, lora_row)
+            self.lora_xa = self.buffer[self.lora_xa_offset:self.lora_xa_offset + num_max_tokens_per_rank * lora_row * 2] \
+                .view(torch.bfloat16).view(num_max_tokens_per_rank, lora_row)
+            self.lora_ret = self.buffer[self.lora_ret_offset:num_bytes].view(torch.bfloat16).view(
+                num_topk, num_max_tokens_per_rank, lora_rank)
+            # Every rank's symmetric buffer base, for writes into a peer's `lora_ret`
+            self.lora_peer_bases = torch.tensor(list(self.handle.buffer_ptrs), dtype=torch.int64, device='cuda')
             self.lora_xa_ring = torch.empty((self.l1_acts.shape[0], lora_rank), dtype=torch.bfloat16, device='cuda')
             # Down LoRA inputs exported by the kernel: BF16 activations of the routed pool rows (worst-case pool
             # size) and of the shared expert's token rows, each pool row's (rank, token, topk), and per local
@@ -118,6 +125,7 @@ class SymmBuffer:
         self.x_sf = None
         self.lora_xa = None
         self.lora_xa_ring = None
+        self.lora_ret = self.lora_peer_bases = None
         self.lora_act = self.lora_shared_act = self.lora_pool_meta = self.lora_expert_info = None
 
 
